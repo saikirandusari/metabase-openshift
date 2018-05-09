@@ -11,20 +11,33 @@ metadata:
     iconClass: "icon-scala"
 objects:
 - apiVersion: v1
+  kind: ServiceAccount
+  metadata:
+    name: ${METABASE_SERVICE_NAME}
+    labels:
+      app: metabase
+      service: ${METABASE_SERVICE_NAME}
+- apiVersion: v1
   kind: Secret
   metadata:
       name: ${METABASE_SERVICE_NAME}-postgresql-credentials
-  data:
+      labels:
+        app: metabase
+        service: ${METABASE_SERVICE_NAME}
+  stringData:
     username: ${POSTGRESQL_USER}
     password: ${POSTGRESQL_PASSWORD}
   type: Opaque
 - apiVersion: v1
   kind: PersistentVolumeClaim
   metadata:
-    name: ${METABASE_SERVICE_NAME}
+    name: ${METABASE_SERVICE_NAME}-postgresql
+    labels:
+      app: metabase
+      service: ${METABASE_SERVICE_NAME}
   spec:
     accessModes:
-    - ReadWriteOnce
+    - ReadWriteMany
     resources:
       requests:
         storage: ${POSTGRESQL_VOLUME_CAPACITY}
@@ -32,9 +45,10 @@ objects:
   kind: Service
   metadata:
     creationTimestamp: null
+    name: ${METABASE_SERVICE_NAME}
     labels:
       app: metabase
-    name: ${METABASE_SERVICE_NAME}
+      service: ${METABASE_SERVICE_NAME}
   spec:
     ports:
     - name: ${METABASE_SERVICE_NAME}
@@ -49,16 +63,31 @@ objects:
   status:
     loadBalancer: {}
 - apiVersion: v1
-  kind: DeploymentConfig
+  kind: Route
   metadata:
+    name: ${METABASE_SERVICE_NAME}
     labels:
       app: metabase
-    name: metabase
+      service: ${METABASE_SERVICE_NAME}
+  spec:
+    tls:
+      insecureEdgeTerminationPolicy: Redirect
+      termination: edge
+    to:
+      kind: Service
+      name: ${METABASE_SERVICE_NAME}
+- apiVersion: v1
+  kind: DeploymentConfig
+  metadata:
+    name: ${METABASE_SERVICE_NAME}
+    labels:
+      app: metabase
+      service: ${METABASE_SERVICE_NAME}
   spec:
     replicas: 1
     selector:
       app: metabase
-      deploymentconfig: metabase
+      deploymentconfig: ${METABASE_SERVICE_NAME}
     strategy:
       resources: {}
       type: Recreate
@@ -67,17 +96,25 @@ objects:
         creationTimestamp: null
         labels:
           app: metabase
-          deploymentconfig: metabase
+          service: ${METABASE_SERVICE_NAME}
+          deploymentconfig: ${METABASE_SERVICE_NAME}
           template: metabase
       spec:
         containers:
-        - env:
+        - name: ${METABASE_SERVICE_NAME}
+          image: ${METABASE_IMAGE}
+          imagePullPolicy: Always
+          env:
           - name: MB_DB_TYPE
             value: postgres
+          - name: MB_DB_HOST
+            valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          - name: MB_DB_PORT
+            value: "5432"
           - name: MB_DB_DBNAME
             value: ${POSTGRESQL_DATABASE}
-          - name: MB_DB_PORT
-            value: ${POSTGRESQL_PORT}
           - name: MB_DB_USER
             valueFrom:
               secretKeyRef:
@@ -88,18 +125,26 @@ objects:
               secretKeyRef:
                 name: ${METABASE_SERVICE_NAME}-postgresql-credentials
                 key: password
-          - name: MB_DB_HOST
-            value: ${METABASE_SERVICE_NAME}-postgresql
-          image: ${METABASE_IMAGE}
-          imagePullPolicy: Always
-          name: ${METABASE_SERVICE_NAME}
+          command:
+             - java
+          args:
+            - '-Xmx300m'
+            - '-Xss512k'
+            - '-Dfile.encoding=UTF-8'
+            - '-Dlogfile.path=target/log'
+            - '-XX:+CMSClassUnloadingEnabled'
+            - '-XX:+UseConcMarkSweepGC'
+            - '-server'
+            - '-jar'
+            - '/app/metabase.jar'
           ports:
           - containerPort: 3000
             name: ${METABASE_SERVICE_NAME}
             protocol: TCP
-          resources: {}
-          securityContext:
-            runAsUser: 1000
+          resources:
+            limits:
+              cpu: 250m
+              memory: 1Gi
           terminationMessagePath: /dev/termination-log
           livenessProbe:
             failureThreshold: 30
@@ -114,7 +159,10 @@ objects:
               port: 3000
             initialDelaySeconds: 3
             timeoutSeconds: 3
-        - env:
+        - name: ${METABASE_SERVICE_NAME}-postgresql
+          image: ${POSTGRESQL_IMAGE}
+          imagePullPolicy: Always
+          env:
           - name: POSTGRESQL_DATABASE
             value: ${POSTGRESQL_DATABASE}
           - name: POSTGRESQL_USER
@@ -127,19 +175,28 @@ objects:
               secretKeyRef:
                 name: ${METABASE_SERVICE_NAME}-postgresql-credentials
                 key: password
-          image: ${POSTGRESQL_IMAGE}
-          imagePullPolicy: Always
-          name: ${METABASE_SERVICE_NAME}-postgresql
           ports:
-          - containerPort: ${POSTGRESQL_PORT}
+          - containerPort: 5432
             protocol: TCP
-          resources: {}
-          securityContext:
-            runAsUser: 1000
+          resources:
+            limits:
+              cpu: 250m
+              memory: 1Gi
           terminationMessagePath: /dev/termination-log
           volumeMounts:
           - mountPath: /var/lib/pgsql/data
             name: ${METABASE_SERVICE_NAME}-postgresql-data
+          livenessProbe:
+            failureThreshold: 30
+            tcpSocket:
+                port: 5432
+            initialDelaySeconds: 240
+            timeoutSeconds: 3
+          readinessProbe:
+            tcpSocket:
+                port: 5432
+            initialDelaySeconds: 3
+            timeoutSeconds: 3
         dnsPolicy: ClusterFirst
         restartPolicy: Always
         securityContext: {}
@@ -150,22 +207,10 @@ objects:
         - name: ${METABASE_SERVICE_NAME}-postgresql-data
           persistentVolumeClaim:
             claimName: ${METABASE_SERVICE_NAME}-postgresql
-        livenessProbe:
-          failureThreshold: 30
-          tcpSocket:
-              port: ${POSTGRESQL_PORT}
-          initialDelaySeconds: 240
-          timeoutSeconds: 3
-        readinessProbe:
-          tcpSocket:
-              port: ${POSTGRESQL_PORT}
-          initialDelaySeconds: 3
-          timeoutSeconds: 3
     triggers:
     - type: ConfigChange
     strategy:
       type: Rolling
-  status: {}
 parameters:
 - name: METABASE_SERVICE_NAME
   displayName: Metabase Service Name
@@ -173,7 +218,7 @@ parameters:
   required: true
 - name: METABASE_IMAGE
   displayName: Metabase Docker Image
-  value: metabase/metabase:latest
+  value: registry.hub.docker.com/metabase/metabase:latest
   description: The metabase docker image to use
   required: true
 - name: POSTGRESQL_IMAGE
@@ -185,11 +230,6 @@ parameters:
   displayName: PostgreSQL Database
   description: Database name to use
   value: metabase
-  required: true
-- name: POSTGRESQL_PORT
-  displayName: PostgreSQL Database Port
-  description: Port to use when connecting to the database.
-  value: "5432"
   required: true
 - name: POSTGRESQL_USER
   displayName: PostgreSQL Username
